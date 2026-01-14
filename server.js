@@ -9,12 +9,11 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
-// const puppeteer = require('puppeteer'); // <-- DELETED
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || "greenhaven_secret_key_123"; 
-const ADMIN_SECRET_CODE = process.env.ADMIN_SECRET || "admin123"; 
+const JWT_SECRET = process.env.JWT_SECRET || "greenhaven_secret_key_123";
+const ADMIN_SECRET_CODE = process.env.ADMIN_SECRET || "admin123";
 const razorpay = new Razorpay({
     key_id: process.env.RAZORPAY_KEY_ID,
     key_secret: process.env.RAZORPAY_KEY_SECRET
@@ -45,7 +44,7 @@ const upload = multer({ storage: storage });
 // --- 4. SECURITY MIDDLEWARE ---
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1]; 
+    const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.status(401).json({ error: "Access Denied" });
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
@@ -68,7 +67,7 @@ const UserSchema = new mongoose.Schema({
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
-    role: { type: String, default: 'admin' }, 
+    role: { type: String, default: 'admin' },
     createdAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', UserSchema);
@@ -100,27 +99,32 @@ const OrderSchema = new mongoose.Schema({
     customerPhone: { type: String, required: true },
     items: [{
         product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
-        name: String, qty: Number, price: Number
+        name: String, 
+        qty: Number, 
+        price: Number,
+        returnedQty: { type: Number, default: 0 } 
     }],
     subtotal: { type: Number, default: 0 },
     taxAmount: { type: Number, default: 0 },
     deliveryFee: { type: Number, default: 0 },
     totalAmount: { type: Number, required: true },
-    paymentStatus: { type: String, enum: ['PAID', 'DUE'], default: 'DUE' },
+    // NOTE: 'PARTIAL_RETURN' Removed from active usage logic, strictly PAID/DUE/CANCELLED
+    paymentStatus: { type: String, enum: ['PAID', 'DUE', 'CANCELLED', 'PARTIAL_RETURN'], default: 'DUE' },
     transactionId: { type: String, default: '' },
     isCollected: { type: Boolean, default: false },
     orderType: { type: String, enum: ['pickup', 'delivery'], default: 'pickup' },
     address: { type: String, default: "" },
+    refundedAmount: { type: Number, default: 0 },
+    status: { type: String, default: 'ACTIVE' } 
 }, { timestamps: true });
 
 const Order = mongoose.model('Order', OrderSchema);
 
 
-// --- CUSTOMER SCHEMA (For Store Users) ---
 const CustomerSchema = new mongoose.Schema({
     name: { type: String, default: "Guest" },
     phone: { type: String, required: true, unique: true },
-    password: { type: String }, // Optional initially, set later
+    password: { type: String }, 
     otp: { type: String },
     otpExpires: { type: Date },
     isVerified: { type: Boolean, default: false },
@@ -134,7 +138,6 @@ const Customer = mongoose.model('Customer', CustomerSchema);
 // --- 6. ROUTES ---
 // ======================================================
 
-// --- AUTH ROUTES ---
 app.post('/api/signup', async (req, res) => {
     try {
         const { name, email, password, adminCode } = req.body;
@@ -160,7 +163,6 @@ app.post('/api/login', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// --- PRODUCT ROUTES ---
 app.get('/api/products', async (req, res) => {
     try {
         const products = await Product.find().sort({ _id: -1 });
@@ -168,10 +170,9 @@ app.get('/api/products', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// --- STOCK VALIDATION ROUTE (Strict Match) ---
 app.post('/api/products/validate-stock', async (req, res) => {
     try {
-        const { items } = req.body; 
+        const { items } = req.body;
         const outOfStockItems = [];
 
         for (const item of items) {
@@ -181,19 +182,18 @@ app.post('/api/products/validate-stock', async (req, res) => {
             let availableStock = 0;
             let itemName = product.name;
 
-            // Strict Variant Matching
             if (item.variant && product.variants.length > 0) {
-                const targetVariant = product.variants.find(v => 
-                    (v._id && item.variant._id && v._id.toString() === item.variant._id) || 
+                const targetVariant = product.variants.find(v =>
+                    (v._id && item.variant._id && v._id.toString() === item.variant._id) ||
                     (v.variety === item.variant.variety && v.color === item.variant.color && v.height === item.variant.height)
                 );
-                
+
                 if (targetVariant) {
                     availableStock = targetVariant.countInStock;
-                    itemName = `${product.name} (${targetVariant.variety} ${targetVariant.color||''} ${targetVariant.height||''})`;
+                    itemName = `${product.name} (${targetVariant.variety} ${targetVariant.color || ''} ${targetVariant.height || ''})`;
                 }
             } else if (product.variants.length > 0) {
-                availableStock = product.variants[0].countInStock; 
+                availableStock = product.variants[0].countInStock;
             } else {
                 availableStock = product.countInStock || 0;
             }
@@ -258,10 +258,9 @@ app.delete('/api/products/:id', authenticateToken, requireAdmin, async (req, res
 });
 
 // ======================================================
-// --- 7. ORDER PROCESSING & PAYMENT (NO TAX) ---
+// --- 7. ORDER PROCESSING ---
 // ======================================================
 
-// 1. CREATE PAYMENT ORDER (Strict Stock & No Tax)
 app.post('/api/payment/create', async (req, res) => {
     try {
         const { items, orderType } = req.body;
@@ -275,27 +274,23 @@ app.post('/api/payment/create', async (req, res) => {
             let currentStock = 0;
             let variantName = "";
 
-            // --- STRICT VARIANT MATCHING ---
             let targetVariant = null;
             if (item.variant && product.variants.length > 0) {
                 targetVariant = product.variants.find(v => {
                     if (v._id && item.variant._id && v._id.toString() === item.variant._id) return true;
-                    // Match attributes carefully
-                    return (v.variety === item.variant.variety) && 
-                           (v.color === item.variant.color) && 
-                           (v.height === item.variant.height);
+                    return (v.variety === item.variant.variety) && (v.color === item.variant.color) && (v.height === item.variant.height);
                 });
             } else if (product.variants.length > 0) {
                 targetVariant = product.variants[0];
             } else {
-                currentStock = product.countInStock || 0; // Simple product
+                currentStock = product.countInStock || 0;
                 priceToUse = product.basePrice;
             }
 
             if (targetVariant) {
                 priceToUse = targetVariant.price;
                 currentStock = targetVariant.countInStock;
-                variantName = `(${targetVariant.variety} ${targetVariant.color||''} ${targetVariant.height||''})`;
+                variantName = `(${targetVariant.variety} ${targetVariant.color || ''} ${targetVariant.height || ''})`;
             }
 
             if (item.qty > currentStock) {
@@ -305,15 +300,14 @@ app.post('/api/payment/create', async (req, res) => {
             calculatedSubtotal += (Number(priceToUse) * Number(item.qty));
         }
 
-        // --- UPDATED: NO TAX ---
-        const taxAmount = 0; // Set to 0
+        const taxAmount = 0; 
         let deliveryFee = orderType === 'delivery' ? 40 : 0;
         let finalTotal = Math.round(calculatedSubtotal + taxAmount + deliveryFee);
 
         if (finalTotal <= 0) return res.status(400).json({ error: "Invalid amount" });
 
         const options = {
-            amount: Math.round(finalTotal * 100), // Paise
+            amount: Math.round(finalTotal * 100), 
             currency: "INR",
             receipt: `receipt_${Date.now()}`
         };
@@ -324,11 +318,10 @@ app.post('/api/payment/create', async (req, res) => {
     } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// 2. SAVE ORDER (Strict Deduction & No Tax)
 app.post('/api/orders', async (req, res) => {
     try {
         const { items, customerName, customerPhone, orderType, address, paymentStatus, transactionId } = req.body;
-        
+
         let calculatedSubtotal = 0;
         let secureItems = [];
         const shortToken = Math.floor(1000 + Math.random() * 9000).toString();
@@ -341,24 +334,20 @@ app.post('/api/orders', async (req, res) => {
             let targetVariant = null;
             let variantLabel = "";
 
-            // --- STRICT MATCHING AGAIN ---
             if (item.variant && product.variants.length > 0) {
                 targetVariant = product.variants.find(v => {
                     if (v._id && item.variant._id && v._id.toString() === item.variant._id) return true;
-                    return (v.variety === item.variant.variety) && 
-                           (v.color === item.variant.color) && 
-                           (v.height === item.variant.height);
+                    return (v.variety === item.variant.variety) && (v.color === item.variant.color) && (v.height === item.variant.height);
                 });
             } else if (product.variants.length > 0) {
                 targetVariant = product.variants[0];
             }
 
-            // Deduct Stock
             if (targetVariant) {
                 if (targetVariant.countInStock < item.qty) return res.status(400).json({ error: `Stock changed: ${product.name} is now out of stock.` });
                 targetVariant.countInStock -= item.qty;
                 priceToUse = targetVariant.price || 0;
-                variantLabel = ` - ${targetVariant.variety} ${targetVariant.color||''} ${targetVariant.height||''}`;
+                variantLabel = ` - ${targetVariant.variety} ${targetVariant.color || ''} ${targetVariant.height || ''}`;
             } else {
                 if (product.countInStock < item.qty) return res.status(400).json({ error: `Stock changed: ${product.name}` });
                 product.countInStock -= item.qty;
@@ -371,12 +360,12 @@ app.post('/api/orders', async (req, res) => {
                 product: product._id,
                 name: `${product.name}${variantLabel}`,
                 qty: item.qty,
-                price: priceToUse
+                price: priceToUse,
+                returnedQty: 0 
             });
         }
 
-        // --- UPDATED: NO TAX ---
-        const taxAmount = 0; // Set to 0
+        const taxAmount = 0; 
         let deliveryFee = orderType === 'delivery' ? 40 : 0;
         let finalTotal = Math.round(calculatedSubtotal + taxAmount + deliveryFee);
 
@@ -387,7 +376,6 @@ app.post('/api/orders', async (req, res) => {
             try {
                 const payment = await razorpay.payments.fetch(transactionId);
                 if (payment.status === 'captured') {
-                    // Verify amount (allow 2 INR variance for rounding)
                     if (Math.abs(payment.amount - (finalTotal * 100)) > 200) {
                         return res.status(400).json({ error: "Payment amount mismatch." });
                     }
@@ -403,7 +391,7 @@ app.post('/api/orders', async (req, res) => {
 
         const newOrder = new Order({
             shortToken, customerName, customerPhone, orderType, address,
-            items: secureItems, 
+            items: secureItems,
             subtotal: calculatedSubtotal,
             taxAmount: 0,
             deliveryFee: deliveryFee,
@@ -417,20 +405,14 @@ app.post('/api/orders', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// --- PUBLIC: UPDATE PAYMENT STATUS (For Tracking Page) ---
 app.put('/api/orders/update-payment', async (req, res) => {
     try {
         const { orderId, paymentId, status } = req.body;
-
-        // 1. Find the order
         const order = await Order.findById(orderId);
         if (!order) return res.status(404).json({ error: "Order not found" });
 
-        // 2. Update status
-        order.paymentStatus = status; // 'PAID'
+        order.paymentStatus = status; 
         order.transactionId = paymentId;
-        
-        // 3. Save
         await order.save();
 
         res.json({ success: true, message: "Payment updated", order });
@@ -439,7 +421,7 @@ app.put('/api/orders/update-payment', async (req, res) => {
     }
 });
 
-app.get('/api/orders',authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/orders', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const orders = await Order.find().sort({ createdAt: -1 });
         res.json(orders);
@@ -462,13 +444,12 @@ app.put('/api/orders/collect/:id', async (req, res) => {
 
 app.get('/api/orders/track/:phone', async (req, res) => {
     try {
-        const orders = await Order.find({ customerPhone: req.params.phone }).sort({ createdAt: -1 }); 
+        const orders = await Order.find({ customerPhone: req.params.phone }).sort({ createdAt: -1 });
         if (!orders || orders.length === 0) return res.status(404).json({ error: "No orders found" });
         res.json(orders);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Route to get a single order by ID for Verification
 app.get('/api/orders/:id', async (req, res) => {
     try {
         const order = await Order.findById(req.params.id);
@@ -493,44 +474,120 @@ app.post('/api/payment/verify', async (req, res) => {
     } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+// ====================================================================
+// --- FIXED: SAFE RETURN LOGIC (Active Orders Stay Active) ---
+// ====================================================================
+app.post('/api/orders/return-cancel', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { orderId, itemsToReturn, actionType } = req.body;
+        // actionType: 'CANCEL_ORDER' (Full) OR 'RETURN_ITEMS' (Partial)
+
+        const order = await Order.findById(orderId);
+        if (!order) return res.status(404).json({ error: "Order not found" });
+
+        // 1. Check Global Order Status
+        if (order.paymentStatus === 'CANCELLED') {
+            return res.status(400).json({ error: "Order is already completely cancelled." });
+        }
+
+        let currentRefundAmount = 0;
+
+        // 2. Process Items
+        const itemsToProcess = (actionType === 'CANCEL_ORDER') 
+            ? order.items.map(i => ({ orderItemId: i._id.toString(), qty: (i.qty - (i.returnedQty || 0)) }))
+            : itemsToReturn;
+
+        for (const returnItem of itemsToProcess) {
+            const dbItem = order.items.id(returnItem.orderItemId);
+            if (!dbItem) continue;
+
+            const qtyToReturn = Number(returnItem.qty);
+            if (qtyToReturn <= 0) continue;
+
+            const availableToReturn = dbItem.qty - (dbItem.returnedQty || 0);
+            if (qtyToReturn > availableToReturn) {
+                return res.status(400).json({ 
+                    error: `Cannot return ${qtyToReturn} of ${dbItem.name}. Only ${availableToReturn} remaining.` 
+                });
+            }
+
+            // Update item-level returns
+            dbItem.returnedQty = (dbItem.returnedQty || 0) + qtyToReturn;
+            currentRefundAmount += (dbItem.price * qtyToReturn);
+
+            // RESTOCK
+            const product = await Product.findById(dbItem.product);
+            if (product) {
+                let variantFound = false;
+                if (product.variants && product.variants.length > 0) {
+                    const targetVariant = product.variants.find(v => 
+                        dbItem.name.includes(v.variety) && dbItem.price === v.price
+                    );
+                    if (targetVariant) {
+                        targetVariant.countInStock += qtyToReturn;
+                        variantFound = true;
+                    } else {
+                        product.variants[0].countInStock += qtyToReturn;
+                        variantFound = true;
+                    }
+                } 
+                if (!variantFound) {
+                    product.countInStock += qtyToReturn;
+                }
+                await product.save();
+            }
+        }
+
+        // 3. Update Order Totals
+        order.refundedAmount = (order.refundedAmount || 0) + currentRefundAmount;
+
+        // 4. CRITICAL STATUS LOGIC FIX:
+        // ONLY change status to 'CANCELLED' if ALL items are fully returned.
+        // OTHERWISE, leave status as is (PAID or DUE) so it stays in the active tab.
+        const isFullyReturned = order.items.every(item => item.qty === item.returnedQty);
+
+        if (isFullyReturned || actionType === 'CANCEL_ORDER') {
+            order.paymentStatus = 'CANCELLED';
+            order.isCollected = false; // Remove from "Done" tab
+        } else {
+            // It's a partial return. We DO NOT change paymentStatus to 'PARTIAL_RETURN'.
+            // We leave it as 'PAID' or 'DUE' so it stays visible in the Active/Pending tabs.
+            // The frontend will detect 'returnedQty > 0' and show the partial badge.
+        }
+
+        await order.save();
+
+        res.json({
+            success: true,
+            message: isFullyReturned ? "Order Cancelled & Restocked" : "Items Returned & Restocked",
+            refundedAmount: currentRefundAmount,
+            order
+        });
+
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: e.message });
+    }
+});
 
 
 // ======================================================
-// --- CUSTOMER AUTH ROUTES (Hybrid: OTP + Password) ---
+// --- CUSTOMER AUTH ROUTES ---
 // ======================================================
-
-// Helper: Send SMS (Replace console.log with Fast2SMS/Twilio later)
-// REPLACE your sendSMS function in server.js with this:
 
 async function sendSMS(phone, otp) {
-    console.log(`[MOCK SMS] ---------------------------------------`);
     console.log(`[MOCK SMS] Sending OTP to ${phone}: ${otp}`);
-    console.log(`[MOCK SMS] ---------------------------------------`);
-
-    // --- FUTURE: HOW TO USE FETCH (No Axios needed) ---
-    /*
-    try {
-        const url = `https://www.fast2sms.com/dev/bulkV2?authorization=YOUR_API_KEY&variables_values=${otp}&route=otp&numbers=${phone}`;
-        const response = await fetch(url);
-        const data = await response.json();
-        console.log("SMS API Response:", data);
-    } catch (error) {
-        console.error("SMS API Error:", error);
-    }
-    */
     return true;
 }
 
-// 1. SEND OTP (Handles both Sign Up and Login request)
 app.post('/api/customer/send-otp', async (req, res) => {
     try {
         const { phone } = req.body;
         if (!phone) return res.status(400).json({ error: "Phone number required" });
 
         const otp = Math.floor(1000 + Math.random() * 9000).toString();
-        const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 mins
+        const otpExpires = new Date(Date.now() + 10 * 60 * 1000); 
 
-        // Find customer or create new one (Upsert)
         let customer = await Customer.findOne({ phone });
         if (!customer) {
             customer = new Customer({ phone, otp, otpExpires });
@@ -541,13 +598,10 @@ app.post('/api/customer/send-otp', async (req, res) => {
         await customer.save();
 
         await sendSMS(phone, otp);
-
-        res.json({ message: "OTP sent successfully", dev_otp: otp }); // dev_otp for testing only
+        res.json({ message: "OTP sent successfully", dev_otp: otp });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 2. VERIFY OTP (Logs user in immediately)
-// VERIFY OTP & CHECK PROFILE STATUS
 app.post('/api/customer/verify-otp', async (req, res) => {
     try {
         const { phone, otp } = req.body;
@@ -555,75 +609,63 @@ app.post('/api/customer/verify-otp', async (req, res) => {
 
         if (!customer) return res.status(400).json({ error: "Invalid OTP" });
 
-        // Reset OTP
-        customer.otp = undefined; 
+        customer.otp = undefined;
         customer.isVerified = true;
         await customer.save();
 
         const token = jwt.sign({ id: customer._id }, JWT_SECRET, { expiresIn: '30d' });
-
-        // LOGIC: If name is null, empty, OR "Guest", force them to update it
         const nameRequired = !customer.name || customer.name === "Guest";
 
-        res.json({ 
+        res.json({
             message: "Success",
             token,
-            nameRequired, // <--- This triggers the popup
+            nameRequired, 
             user: { name: customer.name || "", phone: customer.phone }
         });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 5. UPDATE PROFILE (Saves Name after OTP)
-// Note: Ensure you have your 'authenticateToken' middleware imported
 app.put('/api/customer/update-profile', authenticateToken, async (req, res) => {
     try {
         const { name } = req.body;
-        
         if (!name) return res.status(400).json({ error: "Name is required" });
 
-        // Update the logged-in user's name
         const customer = await Customer.findByIdAndUpdate(
-            req.user.id, 
+            req.user.id,
             { name: name },
-            { new: true } // Return the updated document
+            { new: true }
         );
 
-        res.json({ 
-            message: "Profile updated", 
-            user: { 
-                id: customer._id, 
-                phone: customer.phone, 
-                name: customer.name, 
-                role: 'customer' 
-            } 
+        res.json({
+            message: "Profile updated",
+            user: {
+                id: customer._id,
+                phone: customer.phone,
+                name: customer.name,
+                role: 'customer'
+            }
         });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 3. SET PASSWORD (To enable password login for future)
 app.post('/api/customer/set-password', authenticateToken, async (req, res) => {
     try {
         const { password, name } = req.body;
-        
-        // Hash password
         const hashedPassword = await bcrypt.hash(password, 10);
-        
-        // Update currently logged in customer
-        await Customer.findByIdAndUpdate(req.user.id, { 
+
+        await Customer.findByIdAndUpdate(req.user.id, {
             password: hashedPassword,
-            name: name || "Valued Customer" // Update name if provided
+            name: name || "Valued Customer" 
         });
 
         res.json({ message: "Password set successfully" });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 4. LOGIN WITH PASSWORD (Fast Login)
 app.post('/api/customer/login', async (req, res) => {
     try {
         const { phone, password } = req.body;
-        
+
         const customer = await Customer.findOne({ phone });
         if (!customer) return res.status(404).json({ error: "Customer not found" });
         if (!customer.password) return res.status(400).json({ error: "Password not set. Login via OTP first." });
@@ -633,9 +675,9 @@ app.post('/api/customer/login', async (req, res) => {
 
         const token = jwt.sign({ id: customer._id, role: 'customer' }, JWT_SECRET, { expiresIn: '30d' });
 
-        res.json({ 
-            token, 
-            user: { id: customer._id, phone: customer.phone, name: customer.name, role: 'customer' } 
+        res.json({
+            token,
+            user: { id: customer._id, phone: customer.phone, name: customer.name, role: 'customer' }
         });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
