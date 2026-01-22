@@ -269,6 +269,7 @@ app.delete('/api/products/:id', authenticateToken, requireAdmin, async (req, res
 
 // --- 1. CREATE ORDER (Always starts as DUE/PENDING) ---
 // This is now called BEFORE payment to reserve stock and get an Order ID
+// --- 1. CREATE ORDER (Check Stock Only - DO NOT DECREASE YET) ---
 app.post('/api/orders', async (req, res) => {
     try {
         const { items, customerName, customerPhone, orderType, address } = req.body;
@@ -277,7 +278,7 @@ app.post('/api/orders', async (req, res) => {
         let secureItems = [];
         const shortToken = Math.floor(1000 + Math.random() * 9000).toString();
 
-        // Stock Deduction Logic
+        // Validate Stock (But do NOT decrease it yet)
         for (const item of items) {
             const product = await Product.findById(item.id || item._id);
             if (!product) continue;
@@ -292,20 +293,19 @@ app.post('/api/orders', async (req, res) => {
             }
 
             if (targetVariant) {
-                // Check stock (Basic check, consider atomic decrement for high volume)
+                // Just CHECK if enough stock exists
                 if (targetVariant.countInStock < item.qty) {
                     return res.status(400).json({ error: `Out of stock: ${product.name} (${targetVariant.variety})` });
                 }
-                targetVariant.countInStock -= item.qty;
                 price = targetVariant.price;
                 variantLabel = ` ${targetVariant.variety}`;
             } else {
+                // Just CHECK if enough stock exists
                 if (product.countInStock < item.qty) {
                     return res.status(400).json({ error: `Out of stock: ${product.name}` });
                 }
-                product.countInStock -= item.qty;
             }
-            await product.save();
+            // REMOVED: await product.save(); <--- CRITICAL: Do not save changes yet!
 
             calculatedSubtotal += (price * item.qty);
             secureItems.push({ product: product._id, name: product.name + variantLabel, qty: item.qty, price, returnedQty: 0 });
@@ -314,21 +314,18 @@ app.post('/api/orders', async (req, res) => {
         let deliveryFee = orderType === 'delivery' ? 40 : 0;
         let totalAmount = calculatedSubtotal + deliveryFee;
 
-        // SECURITY FIX: HARDCODE STATUS TO 'DUE'
-        // We ignore any 'paymentStatus' sent from frontend
         const initialStatus = 'DUE';
 
         const newOrder = new Order({
             shortToken, customerName, customerPhone, orderType, address,
             items: secureItems, subtotal: calculatedSubtotal, deliveryFee, totalAmount,
-            paymentStatus: initialStatus, // <--- FORCED SECURE STATUS
+            paymentStatus: initialStatus,
             transactionId: '',
             isCollected: false
         });
 
         await newOrder.save();
 
-        // Return the Order ID so frontend can use it for PayU
         res.status(201).json({ success: true, order: newOrder, orderId: newOrder._id });
 
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -378,46 +375,95 @@ app.post('/api/payment/generate-hash', async (req, res) => {
 
 
 // --- 3. HANDLE PAYU CALLBACK (Updates DB directly) ---
+// --- 3. HANDLE PAYU CALLBACK (Updates DB & DECREASES STOCK ON SUCCESS) ---
 app.post('/api/payment/callback', async (req, res) => {
     try {
-        console.log("🔔 PayU Callback Received:", req.body);
+        console.log("--------------------------------");
+        console.log("🔔 PayU Callback Received");
 
         const { txnid, amount, productinfo, firstname, email, status, hash, mihpayid } = req.body;
+        
+        // Use your existing ENV variable or fallback to localhost
+        const frontendUrl = process.env.FRONTEND_URL || "http://127.0.0.1:5500"; 
 
-        // 1. VERIFY HASH (Security Check)
+        // 1. Verify Hash
         const reverseHashString = `${PAYU_SALT}|${status}|||||||||||${email}|${firstname}|${productinfo}|${amount}|${txnid}|${PAYU_KEY}`;
         const calculatedHash = crypto.createHash('sha512').update(reverseHashString).digest('hex');
 
-        const FRONTEND_URL = process.env.FRONTEND_URL || "http://127.0.0.1:5500/TARAaang";
-
         if (calculatedHash !== hash) {
-            console.error("❌ Hash Mismatch");
-            return res.redirect(`${FRONTEND_URL}/cart.html?status=error&msg=HashMismatch`);
+            console.error("❌ Security Error: Hash Mismatch");
+            return res.redirect(`${frontendUrl}/cart.html?status=error&msg=HashMismatch`);
         }
 
+        // Fetch Order
+        const order = await Order.findById(txnid);
+        if (!order) {
+            console.error("❌ Order not found for callback");
+            return res.redirect(`${frontendUrl}/cart.html?status=error`);
+        }
+
+        // === CASE A: PAYMENT SUCCESS (Decrease Stock HERE) ===
         if (status === 'success') {
-            console.log(`✅ Payment Success for Order ID: ${txnid}`);
-
-            // 2. UPDATE ORDER STATUS IN DB
-            // txnid IS the orderId because we set it that way in step 2
-            await Order.findByIdAndUpdate(txnid, {
-                paymentStatus: 'PAID',
-                transactionId: mihpayid // Save PayU's reference ID
-            });
-
-            // Redirect to success page
-            res.redirect(`${FRONTEND_URL}/cart.html?status=success&txnId=${txnid}&amt=${amount}`);
-        } else {
-            console.log(`❌ Payment Failed`);
-            // Optional: You might want to release stock here if payment fails
-            res.redirect(`${FRONTEND_URL}/cart.html?status=failed`);
+            console.log(`✅ Payment Success for txn: ${txnid}`);
+            
+            // Only process if not already paid
+            if (order.paymentStatus !== 'PAID') {
+                order.paymentStatus = 'PAID';
+                order.transactionId = mihpayid;
+                
+                // --- NEW: DECREASE STOCK NOW ---
+                for (const item of order.items) {
+                    const product = await Product.findById(item.product);
+                    if (product) {
+                        let variantFound = false;
+                        
+                        // Check Variants
+                        if (product.variants && product.variants.length > 0) {
+                            // Find matching variant by name (since we stored name in order item)
+                            const targetVariant = product.variants.find(v => item.name.includes(v.variety));
+                            
+                            if (targetVariant) {
+                                targetVariant.countInStock -= item.qty; // Decrease Variant Stock
+                                variantFound = true;
+                            } else {
+                                product.variants[0].countInStock -= item.qty; // Fallback
+                                variantFound = true;
+                            }
+                        }
+                        
+                        // Check Main Product
+                        if (!variantFound) {
+                            product.countInStock -= item.qty; // Decrease Main Stock
+                        }
+                        
+                        await product.save(); // SAVE THE DEDUCTION
+                    }
+                }
+                // -------------------------------
+                
+                await order.save();
+            }
+            
+            res.redirect(`${frontendUrl}/cart.html?status=success&txnId=${txnid}&amt=${amount}`);
+        } 
+        
+        // === CASE B: PAYMENT FAILED ===
+        else {
+            console.log(`❌ Payment Failed for txn: ${txnid}`);
+            // We do NOT restock because we never took the stock in step 1
+            order.paymentStatus = 'CANCELLED';
+            await order.save();
+            res.redirect(`${frontendUrl}/cart.html?status=failed`);
         }
+
     } catch (e) {
-        console.error("Callback Error:", e);
-        const FRONTEND_URL = process.env.FRONTEND_URL || "http://127.0.0.1:5500/TARAaang";
-        res.redirect(`${FRONTEND_URL}/cart.html?status=error`);
+        console.error("❌ Callback Exception:", e);
+        const frontendUrl = process.env.FRONTEND_URL || "http://127.0.0.1:5500";
+        res.redirect(`${frontendUrl}/cart.html?status=error`);
     }
 });
+
+
 app.put('/api/orders/update-payment', async (req, res) => {
     try {
         const { orderId, paymentId, status } = req.body;
