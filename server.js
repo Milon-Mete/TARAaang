@@ -7,21 +7,21 @@ const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const Razorpay = require('razorpay');
-const crypto = require('crypto');
+const crypto = require('crypto'); // Built-in Node module for Hashing
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "greenhaven_secret_key_123";
 const ADMIN_SECRET_CODE = process.env.ADMIN_SECRET || "admin123";
-const razorpay = new Razorpay({
-    key_id: process.env.RAZORPAY_KEY_ID,
-    key_secret: process.env.RAZORPAY_KEY_SECRET
-});
+
+// --- PAYU CONFIGURATION ---
+const PAYU_KEY = process.env.PAYU_KEY
+const PAYU_SALT = process.env.PAYU_SALT
 
 // --- 1. CONFIGURATION & MIDDLEWARE ---
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // Required for PayU form posts if you use direct callbacks
 
 // --- 2. DATABASE CONNECTION ---
 mongoose.connect(process.env.MONGO_URI)
@@ -99,23 +99,22 @@ const OrderSchema = new mongoose.Schema({
     customerPhone: { type: String, required: true },
     items: [{
         product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
-        name: String, 
-        qty: Number, 
+        name: String,
+        qty: Number,
         price: Number,
-        returnedQty: { type: Number, default: 0 } 
+        returnedQty: { type: Number, default: 0 }
     }],
     subtotal: { type: Number, default: 0 },
     taxAmount: { type: Number, default: 0 },
     deliveryFee: { type: Number, default: 0 },
     totalAmount: { type: Number, required: true },
-    // NOTE: 'PARTIAL_RETURN' Removed from active usage logic, strictly PAID/DUE/CANCELLED
     paymentStatus: { type: String, enum: ['PAID', 'DUE', 'CANCELLED', 'PARTIAL_RETURN'], default: 'DUE' },
     transactionId: { type: String, default: '' },
     isCollected: { type: Boolean, default: false },
     orderType: { type: String, enum: ['pickup', 'delivery'], default: 'pickup' },
     address: { type: String, default: "" },
     refundedAmount: { type: Number, default: 0 },
-    status: { type: String, default: 'ACTIVE' } 
+    status: { type: String, default: 'ACTIVE' }
 }, { timestamps: true });
 
 const Order = mongoose.model('Order', OrderSchema);
@@ -124,7 +123,7 @@ const Order = mongoose.model('Order', OrderSchema);
 const CustomerSchema = new mongoose.Schema({
     name: { type: String, default: "Guest" },
     phone: { type: String, required: true, unique: true },
-    password: { type: String }, 
+    password: { type: String },
     otp: { type: String },
     otpExpires: { type: Date },
     isVerified: { type: Boolean, default: false },
@@ -258,160 +257,174 @@ app.delete('/api/products/:id', authenticateToken, requireAdmin, async (req, res
 });
 
 // ======================================================
-// --- 7. ORDER PROCESSING ---
+// --- 7. ORDER & PAYMENT PROCESSING (PAYU) ---
 // ======================================================
 
-app.post('/api/payment/create', async (req, res) => {
-    try {
-        const { items, orderType } = req.body;
-        let calculatedSubtotal = 0;
+// --- NEW ROUTE: Generate PayU Hash ---
+// 1. Generate Hash & Info for Frontend Form
+// --- 1. Generate PayU Hash ---
+// ======================================================
+// --- 7. ORDER & PAYMENT PROCESSING (SECURE FLOW) ---
+// ======================================================
 
-        for (const item of items) {
-            const product = await Product.findById(item.id || item._id);
-            if (!product) return res.status(404).json({ error: `Product not found` });
-
-            let priceToUse = product.basePrice || 0;
-            let currentStock = 0;
-            let variantName = "";
-
-            let targetVariant = null;
-            if (item.variant && product.variants.length > 0) {
-                targetVariant = product.variants.find(v => {
-                    if (v._id && item.variant._id && v._id.toString() === item.variant._id) return true;
-                    return (v.variety === item.variant.variety) && (v.color === item.variant.color) && (v.height === item.variant.height);
-                });
-            } else if (product.variants.length > 0) {
-                targetVariant = product.variants[0];
-            } else {
-                currentStock = product.countInStock || 0;
-                priceToUse = product.basePrice;
-            }
-
-            if (targetVariant) {
-                priceToUse = targetVariant.price;
-                currentStock = targetVariant.countInStock;
-                variantName = `(${targetVariant.variety} ${targetVariant.color || ''} ${targetVariant.height || ''})`;
-            }
-
-            if (item.qty > currentStock) {
-                return res.status(400).json({ error: `Out of Stock: ${product.name} ${variantName}. Only ${currentStock} left.` });
-            }
-
-            calculatedSubtotal += (Number(priceToUse) * Number(item.qty));
-        }
-
-        const taxAmount = 0; 
-        let deliveryFee = orderType === 'delivery' ? 40 : 0;
-        let finalTotal = Math.round(calculatedSubtotal + taxAmount + deliveryFee);
-
-        if (finalTotal <= 0) return res.status(400).json({ error: "Invalid amount" });
-
-        const options = {
-            amount: Math.round(finalTotal * 100), 
-            currency: "INR",
-            receipt: `receipt_${Date.now()}`
-        };
-
-        const order = await razorpay.orders.create(options);
-        res.json(order);
-
-    } catch (error) { res.status(500).json({ error: error.message }); }
-});
-
+// --- 1. CREATE ORDER (Always starts as DUE/PENDING) ---
+// This is now called BEFORE payment to reserve stock and get an Order ID
 app.post('/api/orders', async (req, res) => {
     try {
-        const { items, customerName, customerPhone, orderType, address, paymentStatus, transactionId } = req.body;
+        const { items, customerName, customerPhone, orderType, address } = req.body;
 
         let calculatedSubtotal = 0;
         let secureItems = [];
         const shortToken = Math.floor(1000 + Math.random() * 9000).toString();
 
+        // Stock Deduction Logic
         for (const item of items) {
             const product = await Product.findById(item.id || item._id);
-            if (!product) return res.status(404).json({ error: "Product not found" });
+            if (!product) continue;
 
-            let priceToUse = product.basePrice || 0;
-            let targetVariant = null;
+            let price = product.basePrice;
             let variantLabel = "";
+            let targetVariant = null;
 
+            // Find Variant
             if (item.variant && product.variants.length > 0) {
-                targetVariant = product.variants.find(v => {
-                    if (v._id && item.variant._id && v._id.toString() === item.variant._id) return true;
-                    return (v.variety === item.variant.variety) && (v.color === item.variant.color) && (v.height === item.variant.height);
-                });
-            } else if (product.variants.length > 0) {
-                targetVariant = product.variants[0];
+                targetVariant = product.variants.find(v => v.variety === item.variant.variety && v.color === item.variant.color);
             }
 
             if (targetVariant) {
-                if (targetVariant.countInStock < item.qty) return res.status(400).json({ error: `Stock changed: ${product.name} is now out of stock.` });
+                // Check stock (Basic check, consider atomic decrement for high volume)
+                if (targetVariant.countInStock < item.qty) {
+                    return res.status(400).json({ error: `Out of stock: ${product.name} (${targetVariant.variety})` });
+                }
                 targetVariant.countInStock -= item.qty;
-                priceToUse = targetVariant.price || 0;
-                variantLabel = ` - ${targetVariant.variety} ${targetVariant.color || ''} ${targetVariant.height || ''}`;
+                price = targetVariant.price;
+                variantLabel = ` ${targetVariant.variety}`;
             } else {
-                if (product.countInStock < item.qty) return res.status(400).json({ error: `Stock changed: ${product.name}` });
+                if (product.countInStock < item.qty) {
+                    return res.status(400).json({ error: `Out of stock: ${product.name}` });
+                }
                 product.countInStock -= item.qty;
             }
-
             await product.save();
 
-            calculatedSubtotal += (Number(priceToUse) * Number(item.qty));
-            secureItems.push({
-                product: product._id,
-                name: `${product.name}${variantLabel}`,
-                qty: item.qty,
-                price: priceToUse,
-                returnedQty: 0 
-            });
+            calculatedSubtotal += (price * item.qty);
+            secureItems.push({ product: product._id, name: product.name + variantLabel, qty: item.qty, price, returnedQty: 0 });
         }
 
-        const taxAmount = 0; 
         let deliveryFee = orderType === 'delivery' ? 40 : 0;
-        let finalTotal = Math.round(calculatedSubtotal + taxAmount + deliveryFee);
+        let totalAmount = calculatedSubtotal + deliveryFee;
 
-        let finalStatus = 'DUE';
-        let finalTxnId = '';
-
-        if (paymentStatus === 'PAID' && transactionId) {
-            try {
-                const payment = await razorpay.payments.fetch(transactionId);
-                if (payment.status === 'captured') {
-                    if (Math.abs(payment.amount - (finalTotal * 100)) > 200) {
-                        return res.status(400).json({ error: "Payment amount mismatch." });
-                    }
-                    finalStatus = 'PAID';
-                    finalTxnId = transactionId;
-                } else {
-                    return res.status(400).json({ error: "Payment not captured." });
-                }
-            } catch (err) {
-                return res.status(400).json({ error: "Payment Verification Failed" });
-            }
-        }
+        // SECURITY FIX: HARDCODE STATUS TO 'DUE'
+        // We ignore any 'paymentStatus' sent from frontend
+        const initialStatus = 'DUE';
 
         const newOrder = new Order({
             shortToken, customerName, customerPhone, orderType, address,
-            items: secureItems,
-            subtotal: calculatedSubtotal,
-            taxAmount: 0,
-            deliveryFee: deliveryFee,
-            totalAmount: finalTotal,
-            paymentStatus: finalStatus, transactionId: finalTxnId, isCollected: false
+            items: secureItems, subtotal: calculatedSubtotal, deliveryFee, totalAmount,
+            paymentStatus: initialStatus, // <--- FORCED SECURE STATUS
+            transactionId: '',
+            isCollected: false
         });
 
         await newOrder.save();
-        res.status(201).json({ success: true, order: newOrder });
+
+        // Return the Order ID so frontend can use it for PayU
+        res.status(201).json({ success: true, order: newOrder, orderId: newOrder._id });
 
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// --- 2. GENERATE PAYU HASH (Now requires Order ID) ---
+app.post('/api/payment/generate-hash', async (req, res) => {
+    try {
+        // We now receive the orderId created in step 1
+        const { orderId, customerName, customerPhone } = req.body;
+
+        // Fetch the REAL order from DB to get the amount
+        // (Prevents frontend from lying about the price)
+        const order = await Order.findById(orderId);
+        if (!order) return res.status(404).json({ error: "Order not found" });
+
+        const finalTotal = order.totalAmount; // Trust DB, not frontend
+
+        // Auto-generate email for PayU requirement
+        const generatedEmail = `${customerPhone}@taraaang.com`;
+
+        // -- Prepare PayU Data --
+        // USE ORDER ID AS TRANSACTION ID
+        const txnid = orderId.toString();
+        const productinfo = "TARAAANG LANDSCAPE ORDER";
+        const firstname = customerName.split(' ')[0] || "Customer";
+
+        // -- Generate Hash (sha512) --
+        // Formula: key|txnid|amount|productinfo|firstname|email|||||||||||salt
+        const hashString = `${PAYU_KEY}|${txnid}|${finalTotal}|${productinfo}|${firstname}|${generatedEmail}|||||||||||${PAYU_SALT}`;
+        const hash = crypto.createHash('sha512').update(hashString).digest('hex');
+
+        res.json({
+            key: PAYU_KEY,
+            txnid,
+            amount: finalTotal,
+            productinfo,
+            firstname,
+            email: generatedEmail,
+            phone: customerPhone,
+            hash
+        });
+
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// --- 3. HANDLE PAYU CALLBACK (Updates DB directly) ---
+app.post('/api/payment/callback', async (req, res) => {
+    try {
+        console.log("🔔 PayU Callback Received:", req.body);
+
+        const { txnid, amount, productinfo, firstname, email, status, hash, mihpayid } = req.body;
+
+        // 1. VERIFY HASH (Security Check)
+        const reverseHashString = `${PAYU_SALT}|${status}|||||||||||${email}|${firstname}|${productinfo}|${amount}|${txnid}|${PAYU_KEY}`;
+        const calculatedHash = crypto.createHash('sha512').update(reverseHashString).digest('hex');
+
+        const FRONTEND_URL = process.env.FRONTEND_URL || "http://127.0.0.1:5500/TARAaang";
+
+        if (calculatedHash !== hash) {
+            console.error("❌ Hash Mismatch");
+            return res.redirect(`${FRONTEND_URL}/cart.html?status=error&msg=HashMismatch`);
+        }
+
+        if (status === 'success') {
+            console.log(`✅ Payment Success for Order ID: ${txnid}`);
+
+            // 2. UPDATE ORDER STATUS IN DB
+            // txnid IS the orderId because we set it that way in step 2
+            await Order.findByIdAndUpdate(txnid, {
+                paymentStatus: 'PAID',
+                transactionId: mihpayid // Save PayU's reference ID
+            });
+
+            // Redirect to success page
+            res.redirect(`${FRONTEND_URL}/cart.html?status=success&txnId=${txnid}&amt=${amount}`);
+        } else {
+            console.log(`❌ Payment Failed`);
+            // Optional: You might want to release stock here if payment fails
+            res.redirect(`${FRONTEND_URL}/cart.html?status=failed`);
+        }
+    } catch (e) {
+        console.error("Callback Error:", e);
+        const FRONTEND_URL = process.env.FRONTEND_URL || "http://127.0.0.1:5500/TARAaang";
+        res.redirect(`${FRONTEND_URL}/cart.html?status=error`);
+    }
+});
 app.put('/api/orders/update-payment', async (req, res) => {
     try {
         const { orderId, paymentId, status } = req.body;
         const order = await Order.findById(orderId);
         if (!order) return res.status(404).json({ error: "Order not found" });
 
-        order.paymentStatus = status; 
+        order.paymentStatus = status;
         order.transactionId = paymentId;
         await order.save();
 
@@ -421,11 +434,90 @@ app.put('/api/orders/update-payment', async (req, res) => {
     }
 });
 
-app.get('/api/orders', authenticateToken, requireAdmin, async (req, res) => {
+// --- NEW ROUTE: Handle PayU Response (Success/Failure) ---
+app.post('/api/payment/callback', async (req, res) => {
     try {
-        const orders = await Order.find().sort({ createdAt: -1 });
-        res.json(orders);
-    } catch (e) { res.status(500).json({ error: e.message }); }
+        console.log("--------------------------------");
+        console.log("🔔 PayU Callback Received");
+        console.log("Payload:", req.body); // Log the full response from PayU
+
+        const { txnid, amount, productinfo, firstname, email, status, hash } = req.body;
+
+        // ⚠️ CRITICAL: Set this to your frontend address. 
+        // If you use VS Code Live Server, it is usually http://127.0.0.1:5500 or http://localhost:5500
+        const frontendUrl = process.env.FRONTEND_URL || "http://127.0.0.1:5500";
+
+        // 1. Verify Reverse Hash for Security
+        // Formula: salt|status|||||||||||email|firstname|productinfo|amount|txnid|key
+        const reverseHashString = `${PAYU_SALT}|${status}|||||||||||${email}|${firstname}|${productinfo}|${amount}|${txnid}|${PAYU_KEY}`;
+        const calculatedHash = crypto.createHash('sha512').update(reverseHashString).digest('hex');
+
+        // Debugging Hash (Remove in production)
+        // console.log("Calc Hash:", calculatedHash);
+        // console.log("Recv Hash:", hash);
+
+        if (calculatedHash !== hash) {
+            console.error("❌ Security Error: Hash Mismatch");
+            return res.redirect(`${frontendUrl}/cart.html?status=error&msg=HashMismatch`);
+        }
+
+        if (status === 'success') {
+            console.log(`✅ Payment Success for txn: ${txnid}`);
+            // Redirect back to frontend with the txnId. 
+            // The frontend will detect this and create the order in the DB.
+            res.redirect(`${frontendUrl}/cart.html?status=success&txnId=${txnid}&amt=${amount}`);
+        } else {
+            console.log(`❌ Payment Failed/Cancelled for txn: ${txnid}`);
+            res.redirect(`${frontendUrl}/cart.html?status=failed`);
+        }
+    } catch (e) {
+        console.error("❌ Callback Exception:", e);
+        const frontendUrl = process.env.FRONTEND_URL || "http://127.0.0.1:5500";
+        res.redirect(`${frontendUrl}/cart.html?status=error`);
+    }
+});
+
+// server.js
+
+// --- MARK ORDER AS COLLECTED ---
+app.put('/api/orders/collect/:id', async (req, res) => {
+    try {
+        const orderId = req.params.id;
+
+        // Find and update the order
+        const order = await Order.findByIdAndUpdate(
+            orderId,
+            {
+                isCollected: true,
+                status: 'COMPLETED' // Optional: Mark as fully complete
+            },
+            { new: true } // Return the updated document
+        );
+
+        if (!order) {
+            return res.status(404).json({ error: "Order not found" });
+        }
+
+        res.json({ success: true, order });
+    } catch (e) {
+        console.error("Collect Error:", e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// --- NEW ROUTE: Get Single Order (Public) ---
+// This is required for the Success Page to render the receipt
+app.get('/api/orders/:id', async (req, res) => {
+    try {
+        const order = await Order.findById(req.params.id);
+        if (order) {
+            res.json(order);
+        } else {
+            res.status(404).json({ message: 'Order not found' });
+        }
+    } catch (error) {
+        res.status(500).json({ message: 'Server Error' });
+    }
 });
 
 app.put('/api/orders/:id', authenticateToken, requireAdmin, async (req, res) => {
@@ -450,28 +542,13 @@ app.get('/api/orders/track/:phone', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/orders/:id', async (req, res) => {
+// Add this with your other Admin routes
+app.get('/api/orders', authenticateToken, requireAdmin, async (req, res) => {
     try {
-        const order = await Order.findById(req.params.id);
-        if (order) {
-            res.json(order);
-        } else {
-            res.status(404).json({ message: 'Order not found' });
-        }
-    } catch (error) {
-        res.status(500).json({ message: 'Server Error' });
-    }
-});
-
-app.post('/api/payment/verify', async (req, res) => {
-    try {
-        const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-        const body = razorpay_order_id + "|" + razorpay_payment_id;
-        const expectedSignature = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(body.toString()).digest('hex');
-
-        if (expectedSignature === razorpay_signature) res.json({ success: true, message: "Payment Verified" });
-        else res.status(400).json({ success: false, error: "Invalid Signature" });
-    } catch (error) { res.status(500).json({ error: error.message }); }
+        // Fetch all orders, newest first
+        const orders = await Order.find().sort({ createdAt: -1 });
+        res.json(orders);
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ====================================================================
@@ -493,7 +570,7 @@ app.post('/api/orders/return-cancel', authenticateToken, requireAdmin, async (re
         let currentRefundAmount = 0;
 
         // 2. Process Items
-        const itemsToProcess = (actionType === 'CANCEL_ORDER') 
+        const itemsToProcess = (actionType === 'CANCEL_ORDER')
             ? order.items.map(i => ({ orderItemId: i._id.toString(), qty: (i.qty - (i.returnedQty || 0)) }))
             : itemsToReturn;
 
@@ -506,8 +583,8 @@ app.post('/api/orders/return-cancel', authenticateToken, requireAdmin, async (re
 
             const availableToReturn = dbItem.qty - (dbItem.returnedQty || 0);
             if (qtyToReturn > availableToReturn) {
-                return res.status(400).json({ 
-                    error: `Cannot return ${qtyToReturn} of ${dbItem.name}. Only ${availableToReturn} remaining.` 
+                return res.status(400).json({
+                    error: `Cannot return ${qtyToReturn} of ${dbItem.name}. Only ${availableToReturn} remaining.`
                 });
             }
 
@@ -520,7 +597,7 @@ app.post('/api/orders/return-cancel', authenticateToken, requireAdmin, async (re
             if (product) {
                 let variantFound = false;
                 if (product.variants && product.variants.length > 0) {
-                    const targetVariant = product.variants.find(v => 
+                    const targetVariant = product.variants.find(v =>
                         dbItem.name.includes(v.variety) && dbItem.price === v.price
                     );
                     if (targetVariant) {
@@ -530,7 +607,7 @@ app.post('/api/orders/return-cancel', authenticateToken, requireAdmin, async (re
                         product.variants[0].countInStock += qtyToReturn;
                         variantFound = true;
                     }
-                } 
+                }
                 if (!variantFound) {
                     product.countInStock += qtyToReturn;
                 }
@@ -542,17 +619,11 @@ app.post('/api/orders/return-cancel', authenticateToken, requireAdmin, async (re
         order.refundedAmount = (order.refundedAmount || 0) + currentRefundAmount;
 
         // 4. CRITICAL STATUS LOGIC FIX:
-        // ONLY change status to 'CANCELLED' if ALL items are fully returned.
-        // OTHERWISE, leave status as is (PAID or DUE) so it stays in the active tab.
         const isFullyReturned = order.items.every(item => item.qty === item.returnedQty);
 
         if (isFullyReturned || actionType === 'CANCEL_ORDER') {
             order.paymentStatus = 'CANCELLED';
             order.isCollected = false; // Remove from "Done" tab
-        } else {
-            // It's a partial return. We DO NOT change paymentStatus to 'PARTIAL_RETURN'.
-            // We leave it as 'PAID' or 'DUE' so it stays visible in the Active/Pending tabs.
-            // The frontend will detect 'returnedQty > 0' and show the partial badge.
         }
 
         await order.save();
@@ -586,7 +657,7 @@ app.post('/api/customer/send-otp', async (req, res) => {
         if (!phone) return res.status(400).json({ error: "Phone number required" });
 
         const otp = Math.floor(1000 + Math.random() * 9000).toString();
-        const otpExpires = new Date(Date.now() + 10 * 60 * 1000); 
+        const otpExpires = new Date(Date.now() + 10 * 60 * 1000);
 
         let customer = await Customer.findOne({ phone });
         if (!customer) {
@@ -619,7 +690,7 @@ app.post('/api/customer/verify-otp', async (req, res) => {
         res.json({
             message: "Success",
             token,
-            nameRequired, 
+            nameRequired,
             user: { name: customer.name || "", phone: customer.phone }
         });
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -655,7 +726,7 @@ app.post('/api/customer/set-password', authenticateToken, async (req, res) => {
 
         await Customer.findByIdAndUpdate(req.user.id, {
             password: hashedPassword,
-            name: name || "Valued Customer" 
+            name: name || "Valued Customer"
         });
 
         res.json({ message: "Password set successfully" });
