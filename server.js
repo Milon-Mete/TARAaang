@@ -114,6 +114,8 @@ const OrderSchema = new mongoose.Schema({
     orderType: { type: String, enum: ['pickup', 'delivery'], default: 'pickup' },
     address: { type: String, default: "" },
     refundedAmount: { type: Number, default: 0 },
+    couponCode: { type: String, default: "" },
+    discountAmount: { type: Number, default: 0 },
     status: { type: String, default: 'ACTIVE' }
 }, { timestamps: true });
 
@@ -131,6 +133,36 @@ const CustomerSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 const Customer = mongoose.model('Customer', CustomerSchema);
+
+const CouponSchema = new mongoose.Schema({
+    code: { type: String, required: true, unique: true, uppercase: true },
+    discountType: { type: String, enum: ['percentage', 'fixed'], required: true },
+    discountValue: { type: Number, required: true }, // e.g., 10 for 10% or 100 for ₹100
+    minCartValue: { type: Number, default: 0 },
+    expiryDate: { type: Date, required: true },
+    usageLimit: { type: Number, required: true }, // Total people who can use it
+    usedCount: { type: Number, default: 0 },
+    isActive: { type: Boolean, default: true }
+}, { timestamps: true });
+
+const Coupon = mongoose.model('Coupon', CouponSchema);
+
+// --- TEMP ORDER SCHEMA (Holds data until payment is successful) ---
+const TempOrderSchema = new mongoose.Schema({
+    customerName: String,
+    customerPhone: String,
+    items: Array, 
+    address: String,
+    orderType: String,
+    couponCode: String,
+    discountAmount: Number,
+    deliveryFee: Number,
+    subtotal: Number,
+    totalAmount: Number,
+    createdAt: { type: Date, default: Date.now, expires: 3600 } // Auto-delete unpaid orders after 1 hour
+});
+
+const TempOrder = mongoose.model('TempOrder', TempOrderSchema);
 
 
 // ======================================================
@@ -270,189 +302,302 @@ app.delete('/api/products/:id', authenticateToken, requireAdmin, async (req, res
 // --- 1. CREATE ORDER (Always starts as DUE/PENDING) ---
 // This is now called BEFORE payment to reserve stock and get an Order ID
 // --- 1. CREATE ORDER (Check Stock Only - DO NOT DECREASE YET) ---
+
+
+// --- NEW ROUTE: Verify Coupon (For Frontend UI) ---
+app.post('/api/coupons/verify', async (req, res) => {
+    try {
+        const { code, cartValue } = req.body;
+        const coupon = await Coupon.findOne({ 
+            code: code.toUpperCase(), 
+            isActive: true,
+            expiryDate: { $gt: new Date() } 
+        });
+
+        if (!coupon) return res.status(404).json({ error: "Invalid Coupon" });
+        if (coupon.usedCount >= coupon.usageLimit) return res.status(400).json({ error: "Coupon limit reached" });
+        if (cartValue < coupon.minCartValue) return res.status(400).json({ error: `Min spend ₹${coupon.minCartValue} required` });
+
+        let discount = 0;
+        if (coupon.discountType === 'percentage') {
+            discount = (cartValue * coupon.discountValue) / 100;
+        } else {
+            discount = coupon.discountValue;
+        }
+
+        res.json({ success: true, discount: discount, code: coupon.code });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+
+// ======================================================
+// --- MODIFIED ROUTE 1: CREATE TEMP ORDER ---
+// ======================================================
+// Frontend calls this thinking it's creating an order. 
+// We secretly save it to "TempOrder" instead.
+// ======================================================
+// --- MODIFIED ROUTE 1: HYBRID ORDER CREATION ---
+// ======================================================
 app.post('/api/orders', async (req, res) => {
     try {
-        const { items, customerName, customerPhone, orderType, address } = req.body;
+        const { items, customerName, customerPhone, orderType, address, couponCode, paymentStatus } = req.body;
 
+        // 1. Validate Items & Calculate Subtotal
         let calculatedSubtotal = 0;
         let secureItems = [];
-        const shortToken = Math.floor(1000 + Math.random() * 9000).toString();
+        let stockUpdateList = []; // To track what to update if it's a Cash order
 
-        // Validate Stock (But do NOT decrease it yet)
         for (const item of items) {
             const product = await Product.findById(item.id || item._id);
             if (!product) continue;
-
+            
             let price = product.basePrice;
-            let variantLabel = "";
-            let targetVariant = null;
+            let targetVariant = item.variant ? product.variants.find(v => v.variety === item.variant.variety) : null;
+            if (targetVariant) price = targetVariant.price;
+            
+            // Stock Check
+            let availableStock = 0;
+            if(targetVariant) availableStock = targetVariant.countInStock;
+            else availableStock = product.countInStock;
 
-            // Find Variant
-            if (item.variant && product.variants.length > 0) {
-                targetVariant = product.variants.find(v => v.variety === item.variant.variety && v.color === item.variant.color);
+            if(availableStock < item.qty) {
+                 return res.status(400).json({ error: `Out of stock: ${product.name}` });
             }
-
-            if (targetVariant) {
-                // Just CHECK if enough stock exists
-                if (targetVariant.countInStock < item.qty) {
-                    return res.status(400).json({ error: `Out of stock: ${product.name} (${targetVariant.variety})` });
-                }
-                price = targetVariant.price;
-                variantLabel = ` ${targetVariant.variety}`;
-            } else {
-                // Just CHECK if enough stock exists
-                if (product.countInStock < item.qty) {
-                    return res.status(400).json({ error: `Out of stock: ${product.name}` });
-                }
-            }
-            // REMOVED: await product.save(); <--- CRITICAL: Do not save changes yet!
 
             calculatedSubtotal += (price * item.qty);
-            secureItems.push({ product: product._id, name: product.name + variantLabel, qty: item.qty, price, returnedQty: 0 });
+            secureItems.push({ product: product._id, name: product.name, qty: item.qty, price });
+            
+            // Prepare stock update info (Product DB Object, Variant Index, Qty to remove)
+            stockUpdateList.push({ product, targetVariant, qty: item.qty });
+        }
+
+        // 2. Validate Coupon
+        let discountAmount = 0;
+        let validCouponCode = "";
+
+        if (couponCode) {
+            const coupon = await Coupon.findOne({ 
+                code: couponCode.toUpperCase(), 
+                isActive: true, 
+                expiryDate: { $gt: new Date() } 
+            });
+
+            if (coupon && coupon.usedCount < coupon.usageLimit && calculatedSubtotal >= coupon.minCartValue) {
+                if (coupon.discountType === 'percentage') {
+                    discountAmount = (calculatedSubtotal * coupon.discountValue) / 100;
+                } else {
+                    discountAmount = coupon.discountValue;
+                }
+                validCouponCode = coupon.code;
+            } else {
+                return res.status(400).json({ error: "Coupon invalid or conditions not met." });
+            }
         }
 
         let deliveryFee = orderType === 'delivery' ? 40 : 0;
-        let totalAmount = calculatedSubtotal + deliveryFee;
+        let totalAmount = (calculatedSubtotal - discountAmount) + deliveryFee;
 
-        const initialStatus = 'DUE';
 
-        const newOrder = new Order({
-            shortToken, customerName, customerPhone, orderType, address,
-            items: secureItems, subtotal: calculatedSubtotal, deliveryFee, totalAmount,
-            paymentStatus: initialStatus,
-            transactionId: '',
-            isCollected: false
-        });
+        // ============================================================
+        // === BRANCH 1: CASH ON DELIVERY / PAY AT STORE (Create Real Order) ===
+        // ============================================================
+        if (paymentStatus === 'DUE') {
+            
+            const shortToken = Math.floor(1000 + Math.random() * 9000).toString();
+            
+            const newOrder = new Order({
+                shortToken,
+                customerName, customerPhone, orderType, address,
+                items: secureItems,
+                subtotal: calculatedSubtotal,
+                couponCode: validCouponCode,
+                discountAmount,
+                deliveryFee,
+                totalAmount: totalAmount > 0 ? totalAmount : 0,
+                paymentStatus: 'DUE', // Explicitly DUE
+                isCollected: false
+            });
 
-        await newOrder.save();
+            await newOrder.save();
 
-        res.status(201).json({ success: true, order: newOrder, orderId: newOrder._id });
+            // --- A. DECREASE STOCK IMMEDIATELY ---
+            for (const info of stockUpdateList) {
+                // We use the objects we already fetched in step 1 to save DB calls
+                if (info.targetVariant) {
+                    info.targetVariant.countInStock -= info.qty;
+                    // Mongoose requires marking subdocs modified if accessed this way, 
+                    // but safer to find again or just save parent
+                } else {
+                    info.product.countInStock -= info.qty;
+                    if(info.product.variants && info.product.variants.length > 0) {
+                         // Fallback logic if product has variants but user bought "base"
+                         info.product.variants[0].countInStock -= info.qty; 
+                    }
+                }
+                await info.product.save();
+            }
+
+            // --- B. INCREMENT COUPON USAGE IMMEDIATELY ---
+            if (validCouponCode) {
+                await Coupon.findOneAndUpdate(
+                    { code: validCouponCode }, 
+                    { $inc: { usedCount: 1 } }
+                );
+            }
+
+            // Return the FULL ORDER object so frontend can show receipt
+            return res.status(201).json({ success: true, order: newOrder });
+        }
+
+
+        // ============================================================
+        // === BRANCH 2: ONLINE PAYMENT (Create Temp Order) ===
+        // ============================================================
+        else {
+            const newTempOrder = new TempOrder({
+                customerName, customerPhone, orderType, address,
+                items: secureItems, 
+                subtotal: calculatedSubtotal, 
+                couponCode: validCouponCode,
+                discountAmount: discountAmount,
+                deliveryFee, 
+                totalAmount: totalAmount > 0 ? totalAmount : 0
+            });
+
+            await newTempOrder.save();
+            
+            // Return Temp ID. Frontend thinks it's an Order ID.
+            return res.status(201).json({ success: true, orderId: newTempOrder._id, total: newTempOrder.totalAmount });
+        }
 
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ======================================================
+// --- MODIFIED ROUTE 3: CALLBACK (THE SWAP) ---
+// ======================================================
+// If payment is success, move TempOrder -> Real Order & Decrease Stock
 
-// --- 2. GENERATE PAYU HASH (Now requires Order ID) ---
+
 app.post('/api/payment/generate-hash', async (req, res) => {
     try {
-        // We now receive the orderId created in step 1
         const { orderId, customerName, customerPhone } = req.body;
 
-        // Fetch the REAL order from DB to get the amount
-        // (Prevents frontend from lying about the price)
-        const order = await Order.findById(orderId);
-        if (!order) return res.status(404).json({ error: "Order not found" });
+        // 1. Find the Temp Order using the ID provided by frontend
+        const tempOrder = await TempOrder.findById(orderId);
+        if (!tempOrder) return res.status(404).json({ error: "Session expired or invalid" });
 
-        const finalTotal = order.totalAmount; // Trust DB, not frontend
+        const finalTotal = tempOrder.totalAmount; 
 
-        // Auto-generate email for PayU requirement
-        const generatedEmail = `${customerPhone}@taraaang.com`;
-
-        // -- Prepare PayU Data --
-        // USE ORDER ID AS TRANSACTION ID
-        const txnid = orderId.toString();
+        // 2. Prepare PayU Data
+        // We use the TempOrder ID as the Transaction ID (txnid)
+        const txnid = orderId.toString(); 
         const productinfo = "TARAAANG LANDSCAPE ORDER";
         const firstname = customerName.split(' ')[0] || "Customer";
+        const generatedEmail = `${customerPhone}@taraaang.com`;
 
-        // -- Generate Hash (sha512) --
-        // Formula: key|txnid|amount|productinfo|firstname|email|||||||||||salt
+        // 3. Generate Hash
         const hashString = `${PAYU_KEY}|${txnid}|${finalTotal}|${productinfo}|${firstname}|${generatedEmail}|||||||||||${PAYU_SALT}`;
         const hash = crypto.createHash('sha512').update(hashString).digest('hex');
 
         res.json({
-            key: PAYU_KEY,
-            txnid,
-            amount: finalTotal,
-            productinfo,
-            firstname,
-            email: generatedEmail,
-            phone: customerPhone,
-            hash
+            key: PAYU_KEY, txnid, amount: finalTotal, productinfo, firstname, 
+            email: generatedEmail, phone: customerPhone, hash
         });
 
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 
-// --- 3. HANDLE PAYU CALLBACK (Updates DB directly) ---
-// --- 3. HANDLE PAYU CALLBACK (Updates DB & DECREASES STOCK ON SUCCESS) ---
 app.post('/api/payment/callback', async (req, res) => {
     try {
-        console.log("--------------------------------");
         console.log("🔔 PayU Callback Received");
-
         const { txnid, amount, productinfo, firstname, email, status, hash, mihpayid } = req.body;
-        
-        // Use your existing ENV variable or fallback to localhost
-        const frontendUrl = process.env.FRONTEND_URL || "http://127.0.0.1:5500"; 
+        const frontendUrl = process.env.FRONTEND_URL || "http://127.0.0.1:5500";
 
         // 1. Verify Hash
         const reverseHashString = `${PAYU_SALT}|${status}|||||||||||${email}|${firstname}|${productinfo}|${amount}|${txnid}|${PAYU_KEY}`;
         const calculatedHash = crypto.createHash('sha512').update(reverseHashString).digest('hex');
 
         if (calculatedHash !== hash) {
-            console.error("❌ Security Error: Hash Mismatch");
+            console.error("❌ Hash Mismatch");
             return res.redirect(`${frontendUrl}/cart.html?status=error&msg=HashMismatch`);
         }
 
-        // Fetch Order
-        const order = await Order.findById(txnid);
-        if (!order) {
-            console.error("❌ Order not found for callback");
-            return res.redirect(`${frontendUrl}/cart.html?status=error`);
+        // 2. Find the Temp Order
+        const tempOrder = await TempOrder.findById(txnid);
+
+        if (!tempOrder) {
+            console.error("❌ Temp data not found for txn:", txnid);
+            return res.redirect(`${frontendUrl}/cart.html?status=error&msg=DataMissing`);
         }
 
-        // === CASE A: PAYMENT SUCCESS (Decrease Stock HERE) ===
+        // === PAYMENT SUCCESS ===
         if (status === 'success') {
-            console.log(`✅ Payment Success for txn: ${txnid}`);
             
-            // Only process if not already paid
-            if (order.paymentStatus !== 'PAID') {
-                order.paymentStatus = 'PAID';
-                order.transactionId = mihpayid;
-                
-                // --- NEW: DECREASE STOCK NOW ---
-                for (const item of order.items) {
-                    const product = await Product.findById(item.product);
-                    if (product) {
-                        let variantFound = false;
-                        
-                        // Check Variants
-                        if (product.variants && product.variants.length > 0) {
-                            // Find matching variant by name (since we stored name in order item)
-                            const targetVariant = product.variants.find(v => item.name.includes(v.variety));
-                            
-                            if (targetVariant) {
-                                targetVariant.countInStock -= item.qty; // Decrease Variant Stock
-                                variantFound = true;
-                            } else {
-                                product.variants[0].countInStock -= item.qty; // Fallback
-                                variantFound = true;
-                            }
+            // A. Create Real Order
+            const shortToken = Math.floor(1000 + Math.random() * 9000).toString();
+            const newOrder = new Order({
+                shortToken,
+                customerName: tempOrder.customerName,
+                customerPhone: tempOrder.customerPhone,
+                items: tempOrder.items,
+                address: tempOrder.address,
+                orderType: tempOrder.orderType,
+                couponCode: tempOrder.couponCode,
+                discountAmount: tempOrder.discountAmount,
+                subtotal: tempOrder.subtotal,
+                deliveryFee: tempOrder.deliveryFee,
+                totalAmount: tempOrder.totalAmount,
+                paymentStatus: 'PAID', // Directly PAID
+                transactionId: mihpayid,
+                isCollected: false
+            });
+
+            await newOrder.save();
+
+            // B. Decrease Stock
+            for (const item of newOrder.items) {
+                const product = await Product.findById(item.product);
+                if (product) {
+                    let variantFound = false;
+                    if (product.variants && product.variants.length > 0) {
+                        const targetVariant = product.variants.find(v => item.name.includes(v.variety));
+                        if (targetVariant) {
+                            targetVariant.countInStock -= item.qty;
+                            variantFound = true;
+                        } else {
+                            product.variants[0].countInStock -= item.qty;
+                            variantFound = true;
                         }
-                        
-                        // Check Main Product
-                        if (!variantFound) {
-                            product.countInStock -= item.qty; // Decrease Main Stock
-                        }
-                        
-                        await product.save(); // SAVE THE DEDUCTION
+                    } 
+                    if (!variantFound) {
+                        product.countInStock -= item.qty;
                     }
+                    await product.save();
                 }
-                // -------------------------------
-                
-                await order.save();
             }
-            
-            res.redirect(`${frontendUrl}/cart.html?status=success&txnId=${txnid}&amt=${amount}`);
-        } 
+
+            // C. Update Coupon Usage (If used)
+            if (newOrder.couponCode) {
+                await Coupon.findOneAndUpdate(
+                    { code: newOrder.couponCode }, 
+                    { $inc: { usedCount: 1 } }
+                );
+            }
+
+            // D. Delete Temp Order (Cleanup)
+            await TempOrder.findByIdAndDelete(txnid);
+
+            // E. Redirect to Success Page with REAL Order ID
+            res.redirect(`${frontendUrl}/cart.html?status=success&txnId=${newOrder._id}&amt=${amount}`);
         
-        // === CASE B: PAYMENT FAILED ===
-        else {
+        } else {
+            // === PAYMENT FAILED ===
+            // Do nothing to the DB. TempOrder will auto-expire.
             console.log(`❌ Payment Failed for txn: ${txnid}`);
-            // We do NOT restock because we never took the stock in step 1
-            order.paymentStatus = 'CANCELLED';
-            await order.save();
             res.redirect(`${frontendUrl}/cart.html?status=failed`);
         }
 
@@ -525,6 +670,22 @@ app.post('/api/payment/callback', async (req, res) => {
 
 // server.js
 
+// --- GET ALL COUPONS ---
+app.get('/api/admin/coupons', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const coupons = await Coupon.find().sort({ createdAt: -1 });
+        res.json(coupons);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- DELETE COUPON ---
+app.delete('/api/admin/coupons/:id', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        await Coupon.findByIdAndDelete(req.params.id);
+        res.json({ message: "Coupon deleted" });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // --- MARK ORDER AS COLLECTED ---
 app.put('/api/orders/collect/:id', async (req, res) => {
     try {
@@ -596,6 +757,74 @@ app.get('/api/orders', authenticateToken, requireAdmin, async (req, res) => {
         res.json(orders);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+
+app.post('/api/admin/coupons', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const { code, discountType, discountValue, minCartValue, expiryDate, usageLimit } = req.body;
+        
+        const newCoupon = new Coupon({
+            code, discountType, discountValue, minCartValue, 
+            expiryDate: new Date(expiryDate), 
+            usageLimit
+        });
+
+        await newCoupon.save();
+        res.status(201).json({ success: true, coupon: newCoupon });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/orders', async (req, res) => {
+    try {
+        const { items, customerName, customerPhone, orderType, address, couponCode } = req.body;
+
+        // ... [Your existing stock validation logic stays here] ...
+
+        let discountAmount = 0;
+        if (couponCode) {
+            const coupon = await Coupon.findOne({ code: couponCode.toUpperCase(), isActive: true });
+            
+            if (coupon) {
+                const now = new Date();
+                if (now < coupon.expiryDate && coupon.usedCount < coupon.usageLimit && calculatedSubtotal >= coupon.minCartValue) {
+                    
+                    if (coupon.discountType === 'percentage') {
+                        discountAmount = (calculatedSubtotal * coupon.discountValue) / 100;
+                    } else {
+                        discountAmount = coupon.discountValue;
+                    }
+                    
+                    // Increment usage (you could also do this only after successful payment)
+                    coupon.usedCount += 1;
+                    await coupon.save();
+                } else {
+                    return res.status(400).json({ error: "Coupon is invalid, expired, or limit reached." });
+                }
+            }
+        }
+
+        let deliveryFee = orderType === 'delivery' ? 40 : 0;
+        let totalAmount = (calculatedSubtotal - discountAmount) + deliveryFee;
+
+        const newOrder = new Order({
+            // ... existing fields
+            items: secureItems,
+            subtotal: calculatedSubtotal,
+            couponCode: couponCode || "",
+            discountAmount: discountAmount,
+            deliveryFee,
+            totalAmount: totalAmount > 0 ? totalAmount : 0, // Ensure no negative prices
+            paymentStatus: 'DUE'
+        });
+
+        await newOrder.save();
+        res.status(201).json({ success: true, order: newOrder });
+
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 
 // ====================================================================
 // --- FIXED: SAFE RETURN LOGIC (Active Orders Stay Active) ---
